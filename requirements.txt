@@ -4,3 +4,4 @@ motor
 httpx
 redis[hiredis]
 python-dotenv
+pydantic-settings

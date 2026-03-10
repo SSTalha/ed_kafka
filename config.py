@@ -3,9 +3,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
 
-    KAFKA_BROKER_URL: str
-    KAFKA_CONSUMER_GROUP_ID: str
-    KAFKA_TOPIC: str
+    KAFKA_BROKER_URL: str = 'localhost:9092'
+    KAFKA_CONSUMER_GROUP_ID: str = 'loom-ip-events'
+    KAFKA_TOPIC: str = 'raw-ip-events'
     KAFKA_DEAD_LETTER_TOPIC: str = "raw-ip-events-failed"
 
     MONGO_URI: str

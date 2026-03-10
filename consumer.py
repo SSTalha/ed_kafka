@@ -40,21 +40,17 @@ async def process_batch(messages: list[dict], producer: AIOKafkaProducer) -> Non
         try:
             geo_map, failed_ips = await fetch_geo_batch(new_ips)
         except Exception as e:
-            # Complete geo service failure — send entire batch to DLQ
             logger.error(f"Geo service failure: {e}. Sending batch to dead letter queue.")
             await _send_to_dlq(producer, messages)
-            raise  # Re-raise so Kafka offset is NOT committed
+            raise
 
-        # Cache all resolved geo results
         if geo_map:
             await bloom.cache_geo_many(geo_map)
 
-        # Mark successfully resolved IPs in bloom filter
         resolved_ips = [ip for ip in new_ips if ip in geo_map]
         if resolved_ips:
             await bloom.add_many(resolved_ips)
 
-        # Send partially failed IPs to DLQ
         if failed_ips:
             failed_messages = [m for m in messages if m["ip"] in failed_ips]
             logger.warning(f"{len(failed_ips)} IPs failed geo lookup — sending to DLQ")
@@ -66,8 +62,9 @@ async def process_batch(messages: list[dict], producer: AIOKafkaProducer) -> Non
             cached = await bloom.get_cached_geo(ip)
             geo_map[ip] = cached if cached is not None else {}
 
-    # --- Step 5: Build and bulk insert documents ---
+    # --- Step 5: Build and bulk insert — deduplicate at user+ip level ---
     failed_set = set(failed_ips)
+    seen_combinations: set[tuple] = set()
     docs = []
 
     for msg in messages:
@@ -79,7 +76,12 @@ async def process_batch(messages: list[dict], producer: AIOKafkaProducer) -> Non
             continue
 
         if ip in failed_set:
-            continue  # Already sent to DLQ
+            continue
+
+        combo = (user_id, ip)
+        if combo in seen_combinations:
+            continue  # Duplicate user+ip in this batch — skip
+        seen_combinations.add(combo)
 
         docs.append(UserTraffic(
             user_id=user_id,
@@ -90,12 +92,16 @@ async def process_batch(messages: list[dict], producer: AIOKafkaProducer) -> Non
 
     if docs:
         try:
-            await UserTraffic.insert_many(docs)
+            # ordered=False — skips duplicates at DB level, continues inserting rest
+            await UserTraffic.insert_many(docs, ordered=False)
             logger.info(f"Inserted {len(docs)} records into MongoDB")
         except Exception as e:
-            logger.error(f"MongoDB insert failed: {e}. Sending batch to DLQ.")
-            await _send_to_dlq(producer, messages)
-            raise  # Prevent offset commit
+            if "duplicate key" in str(e).lower():
+                logger.info("Some duplicate user+ip combinations skipped by DB index")
+            else:
+                logger.error(f"MongoDB insert failed: {e}. Sending batch to DLQ.")
+                await _send_to_dlq(producer, messages)
+                raise
 
 
 async def _send_to_dlq(producer: AIOKafkaProducer, messages: list[dict]) -> None:
@@ -108,7 +114,6 @@ async def _send_to_dlq(producer: AIOKafkaProducer, messages: list[dict]) -> None
 
 
 async def consume() -> None:
-    # --- Initialize connections ---
     await connect_db()
     await connect_redis()
 
@@ -128,6 +133,9 @@ async def consume() -> None:
         value_deserializer=lambda m: json.loads(m.decode("utf-8")),
         auto_offset_reset="earliest",
         enable_auto_commit=False,
+        retry_backoff_ms=2000,
+        metadata_max_age_ms=30000,
+        request_timeout_ms=30000,
     )
 
     await producer.start()
@@ -153,7 +161,6 @@ async def consume() -> None:
                     await consumer.commit()
                     logger.info("Kafka offset committed")
                 except Exception as e:
-                    # Do NOT commit — Kafka will redeliver this batch
                     logger.error(f"Batch processing failed, offset NOT committed: {e}")
                 finally:
                     batch = []
